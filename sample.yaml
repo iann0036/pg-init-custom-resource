@@ -1,0 +1,156 @@
+Description: Sample stack for RDS database init
+
+Parameters:
+  DatabaseInstanceName:
+    Type: String
+    Description: Database instance name
+    Default: sampledbinstance
+  
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The VPC to deploy into
+  
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of subnet IDs to assign to the database and Lambda
+
+Resources:
+  DatabaseInitLambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Sample DB init Lambda security group"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+      - IpProtocol: udp
+        FromPort: 53
+        ToPort: 53
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 5432
+        ToPort: 5432
+        CidrIp: 0.0.0.0/0
+  
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Sample DB init DB security group"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 5432
+        ToPort: 5432
+        CidrIp: 0.0.0.0/0
+        
+  DatabaseSubnetGroup: 
+    Type: "AWS::RDS::DBSubnetGroup"
+    Properties: 
+      DBSubnetGroupDescription: "Sample Subnet Group for RDS database init"
+      SubnetIds: !Ref SubnetIds
+
+  DatabaseMasterCredential:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: sampledbmastercredentials
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "mydbadmin"}'
+        GenerateStringKey: "password"
+        PasswordLength: 24
+        ExcludePunctuation: true
+  
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    DependsOn:
+      - DatabaseMasterCredential
+    Properties:
+      DBInstanceIdentifier: !Ref DatabaseInstanceName
+      DBInstanceClass: "db.t2.small"
+      Engine: postgres
+      Port: 5432
+      AllocatedStorage: 100
+      MasterUsername: "{{resolve:secretsmanager:sampledbmastercredentials:SecretString:username}}"
+      MasterUserPassword: "{{resolve:secretsmanager:sampledbmastercredentials:SecretString:password}}"
+      EngineVersion: "9.6.9"
+      StorageType: gp2
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+  
+  DatabaseInitLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: |
+        {
+          "Statement": [{
+            "Action": "sts:AssumeRole",
+            "Effect": "Allow",
+            "Principal": {
+              "Service": "lambda.amazonaws.com"
+            }
+          }]
+        }
+      Policies:
+        - PolicyName: !Sub DatabaseInitLambdaRole-policy
+          PolicyDocument: |
+            {
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "lambda:InvokeFunction",
+                    "ec2:*",
+                    "logs:*",
+                    "secretsmanager:*"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+  
+  DatabaseInitLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt DatabaseInitLambdaRole.Arn
+      ReservedConcurrentExecutions: 1
+      Runtime: python3.6
+      Timeout: 60
+      Code:
+        S3Bucket: kablamo-rds-custom-resource
+        S3Key: app.zip
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref DatabaseInitLambdaSecurityGroup
+        SubnetIds: !Ref SubnetIds
+
+  DatabaseInit: 
+    Type: "Custom::DatabaseInit"
+    DependsOn:
+      - DatabaseMasterCredential
+    Properties: 
+      ServiceToken: !GetAtt DatabaseInitLambda.Arn
+      StackName: !Ref "AWS::StackName"
+      RdsProperties:
+        EndpointAddress: !GetAtt DatabaseInstance.Endpoint.Address
+        MasterSecretId: "sampledbmastercredentials"
+        Execute:
+          - DatabaseName: "postgres"
+            Scripts:
+              - 'CREATE DATABASE "mydb";'
+          - DatabaseName: "mydb"
+            Scripts:
+              - 'CREATE EXTENSION IF NOT EXISTS "uuid-ossp";'
+        DatabaseUsers:
+          - Name: mysuperuser
+            SuperUser: true
+            SecretId: "mysuperusercredential"
+          - Name: myapp
+            SecretId: "myappcredential"
+            Grants:
+              - Database: postgres
+                Permissions: CONNECT
+              - Database: mydb
+                Permissions: ALL PRIVILEGES
